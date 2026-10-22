@@ -258,7 +258,7 @@ Operate
   stop-node <node>       hard power-off one VM
   start-node <node>      boot one VM (services start automatically)
   psql [rw|ro]           connect through the VIP
-  ssh <node>             shell on a node
+  ssh <node> [-- cmd]    shell on a node, or run one command
   logs <node> [service]  follow journal (default: patroni / haproxy)
 
 Nodes: $ALL_NAMES
@@ -277,7 +277,9 @@ case ${1:-} in
   stop-node)   vagrant halt --force "${2:?node required}" ;;
   start-node)  vagrant up "${2:?node required}"; refresh_ssh ;;
   psql)        cmd_psql "${2:-rw}" ;;
-  ssh)         vagrant ssh "${2:?node required}" ;;
+  ssh)         shift; node=${1:?node required}; shift
+               [[ ${1:-} == -- ]] && shift
+               if [[ $# -gt 0 ]]; then on "$node" "$*"; else vagrant ssh "$node"; fi ;;
   logs)        cmd_logs "${2:-}" "${3:-}" ;;
   *)           usage ;;
 esac
