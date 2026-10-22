@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# pglab — build and operate the pgvms Patroni cluster (6x PostgreSQL + 2x HAProxy).
+# Runs on the macOS host; must stay compatible with bash 3.2.
+set -eo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+cd "$ROOT"
+source "$ROOT/cluster.conf"
+
+SSH_CFG="$ROOT/.vagrant/ssh-config"
+S=/opt/pglab/scripts
+
+die() { echo "error: $*" >&2; exit 1; }
+step() { printf '\n\033[1m### %s\033[0m\n' "$*"; }
+
+names() { local n; for n in "$@"; do echo "${n%%:*}"; done; }
+PG_NAMES=$(names $PG_NODES)
+LB_NAMES=$(names $HAPROXY_NODES)
+ALL_NAMES="$PG_NAMES $LB_NAMES"
+PG_COUNT=$(echo $PG_NAMES | wc -w | tr -d ' ')
+FIRST_PG=$(echo $PG_NAMES | awk '{print $1}')
+
+refresh_ssh() {
+  mkdir -p "$ROOT/.vagrant"
+  vagrant ssh-config > "$SSH_CFG" 2>/dev/null || true
+}
+
+on() {
+  local node=$1; shift
+  [[ -s $SSH_CFG ]] || refresh_ssh
+  ssh -F "$SSH_CFG" -o LogLevel=ERROR -o ConnectTimeout=5 -o BatchMode=yes "$node" "$@"
+}
+
+# run_many "<command>" node... — runs as root on each node in parallel, prefixed output.
+run_many() {
+  local cmd=$1; shift
+  local n pids="" rc=0 p
+  for n in "$@"; do
+    ( on "$n" "sudo $cmd" </dev/null 2>&1 | sed "s/^/[$n] /"; exit "${PIPESTATUS[0]}" ) &
+    pids="$pids $!"
+  done
+  for p in $pids; do wait "$p" || rc=1; done
+  return $rc
+}
+
+# wait_for "<description>" <tries> cmd... — polls every 5s.
+wait_for() {
+  local desc=$1 tries=$2 i; shift 2
+  printf '   waiting for %s ' "$desc"
+  for ((i = 0; i < tries; i++)); do
+    if "$@" >/dev/null 2>&1; then echo " ok"; return 0; fi
+    printf '.'; sleep 5
+  done
+  echo; die "timed out waiting for $desc"
+}
+
+reachable_pg() {
+  local n
+  for n in $PG_NAMES; do
+    if on "$n" true 2>/dev/null; then echo "$n"; return 0; fi
+  done
+  return 1
+}
+
+leader() { on "${1:-$(reachable_pg)}" "sudo bash $S/cluster-state.sh leader"; }
+cluster_healthy() { on "$1" "sudo bash $S/cluster-state.sh healthy $PG_COUNT"; }
+etcd_healthy() {
+  local eps="" n
+  for n in $ETCD_NODES; do eps="$eps${eps:+,}http://$(node_ip "$n"):$ETCD_CLIENT_PORT"; done
+  on "$1" "etcdctl --endpoints=$eps endpoint health"
+}
+
+node_ip() {
+  local n
+  for n in $PG_NODES $HAPROXY_NODES; do
+    [[ ${n%%:*} == "$1" ]] && { echo "${n#*:}"; return 0; }
+  done
+  return 1
+}
+
+# sql <client-node> <port> <sql> — runs SQL through HAProxy on the VIP.
+sql() {
+  printf '%s\n' "$3" | on "$1" "PGPASSWORD='$POSTGRES_PASSWORD' psql -h $VIP -p $2 -U postgres -XAtq -v ON_ERROR_STOP=1"
+}
+
+push_files() {
+  local n pids="" rc=0 p
+  for n in $ALL_NAMES; do
+    ( COPYFILE_DISABLE=1 tar -cz -C "$ROOT" cluster.conf scripts |
+        on "$n" "sudo rm -rf /opt/pglab && sudo mkdir -p /opt/pglab && sudo tar -xz --warning=no-unknown-keyword -C /opt/pglab" ) &
+    pids="$pids $!"
+  done
+  for p in $pids; do wait "$p" || rc=1; done
+  return $rc
+}
+
+cmd_up() {
+  step "Starting VMs ($ALL_NAMES)"
+  vagrant up "$@"
+  refresh_ssh
+}
+
+cmd_deploy() {
+  local start=$SECONDS rest
+  refresh_ssh
+
+  step "Pushing cluster.conf and scripts to /opt/pglab"
+  push_files
+
+  step "Base OS setup and packages"
+  run_many "bash $S/common-setup.sh pg" $PG_NAMES &
+  local pg_pid=$!
+  run_many "bash $S/common-setup.sh lb" $LB_NAMES || die "LB base setup failed"
+  wait $pg_pid || die "PG base setup failed"
+
+  step "Stopping any previous Patroni (fresh deploy)"
+  run_many "sh -c 'systemctl stop patroni 2>/dev/null || true'" $PG_NAMES
+
+  step "etcd cluster ($ETCD_NODES)"
+  run_many "bash $S/etcd-setup.sh" $ETCD_NODES
+  wait_for "etcd quorum" 36 etcd_healthy "$FIRST_PG"
+
+  step "Bootstrapping Patroni leader on $FIRST_PG"
+  run_many "bash $S/patroni-setup.sh" "$FIRST_PG"
+  wait_for "leader $FIRST_PG" 36 leader "$FIRST_PG"
+
+  step "Adding Patroni replicas"
+  rest=$(echo $PG_NAMES | cut -d' ' -f2-)
+  run_many "bash $S/patroni-setup.sh" $rest
+  wait_for "$((PG_COUNT - 1)) streaming replicas" 60 cluster_healthy "$FIRST_PG"
+
+  step "Creating admin role '$ADMIN_USER'"
+  printf "CREATE ROLE \"%s\" WITH LOGIN SUPERUSER PASSWORD '%s';\n" "$ADMIN_USER" "$ADMIN_PASSWORD" |
+    on "$FIRST_PG" "sudo -u postgres psql -XAtq -v ON_ERROR_STOP=1"
+
+  step "HAProxy + Keepalived ($LB_NAMES)"
+  run_many "sh -c 'bash $S/haproxy-setup.sh && bash $S/keepalived-setup.sh'" $LB_NAMES
+  wait_for "writes via VIP $VIP:$HAPROXY_RW_PORT" 24 sql "$FIRST_PG" "$HAPROXY_RW_PORT" "SELECT 1"
+
+  step "Deployed in $(((SECONDS - start) / 60))m$(((SECONDS - start) % 60))s"
+  cmd_status
+}
+
+cmd_status() {
+  local client n
+  [[ -s $SSH_CFG ]] || refresh_ssh
+  client=$(reachable_pg) || die "no PostgreSQL node reachable (try: ./pglab up)"
+
+  step "Patroni"
+  on "$client" "sudo patronictl -c /etc/patroni/patroni.yml list"
+
+  step "etcd"
+  local eps="" e
+  for e in $ETCD_NODES; do eps="$eps${eps:+,}http://$(node_ip "$e"):$ETCD_CLIENT_PORT"; done
+  on "$client" "etcdctl --endpoints=$eps endpoint status -w table" || true
+
+  step "VIP $VIP"
+  for n in $LB_NAMES; do
+    if on "$n" "ip -o -4 addr show | grep -q ' $VIP/'" 2>/dev/null; then
+      echo "   held by $n"
+    fi
+  done
+
+  step "HAProxy backends (via VIP)"
+  curl -s -m 5 -u "$HAPROXY_STATS_USER:$HAPROXY_STATS_PASSWORD" "http://$VIP:$HAPROXY_STATS_PORT/;csv" |
+    awk -F, '($1=="primary" || $1=="replicas") && $2!="FRONTEND" && $2!="BACKEND" { printf "   %-9s %-10s %s\n", $1, $2, $18 }' ||
+    echo "   stats not reachable at http://$VIP:$HAPROXY_STATS_PORT/"
+
+  echo
+  echo "   RW: psql -h $VIP -p $HAPROXY_RW_PORT -U postgres"
+  echo "   RO: psql -h $VIP -p $HAPROXY_RO_PORT -U postgres"
+  echo "   Stats: http://$VIP:$HAPROXY_STATS_PORT/  ($HAPROXY_STATS_USER/$HAPROXY_STATS_PASSWORD)"
+}
+
+# Hard-kills the leader VM, checks failover through the VIP, then rejoins it.
+cmd_test() {
+  local old new client
+  refresh_ssh
+  old=$(leader) || die "no leader — is the cluster deployed?"
+  for client in $PG_NAMES; do [[ $client != "$old" ]] && break; done
+
+  step "Writing a marker row through $VIP:$HAPROXY_RW_PORT (leader: $old)"
+  sql "$client" "$HAPROXY_RW_PORT" "CREATE TABLE IF NOT EXISTS failover_test (id serial PRIMARY KEY, note text, at timestamptz DEFAULT now());
+INSERT INTO failover_test (note) VALUES ('written on $old before failover');"
+
+  step "Powering off $old (simulated crash)"
+  vagrant halt --force "$old"
+
+  local t0=$SECONDS
+  new_leader_elected() { new=$(leader "$client") && [[ $new != "$old" ]]; }
+  wait_for "a new leader" 36 new_leader_elected
+  new=$(leader "$client")
+  wait_for "HAProxy to route writes to $new" 24 sql "$client" "$HAPROXY_RW_PORT" "SELECT 1 WHERE NOT pg_is_in_recovery()"
+  echo "   failover took ~$((SECONDS - t0))s: $old -> $new"
+
+  step "Writing through the VIP after failover"
+  sql "$client" "$HAPROXY_RW_PORT" "INSERT INTO failover_test (note) VALUES ('written on $new after failover');"
+  echo "   rows visible on RO port $HAPROXY_RO_PORT:"
+  sleep 2
+  sql "$client" "$HAPROXY_RO_PORT" "SELECT id, note FROM failover_test ORDER BY id;" | sed 's/^/     /'
+
+  step "Restarting $old; it should rejoin as a replica (pg_rewind)"
+  vagrant up "$old"
+  refresh_ssh
+  wait_for "all $PG_COUNT members healthy" 60 cluster_healthy "$client"
+  on "$client" "sudo patronictl -c /etc/patroni/patroni.yml list"
+  step "Failover test passed"
+}
+
+cmd_switchover() {
+  local cur client
+  refresh_ssh
+  cur=$(leader) || die "no leader"
+  client=$(reachable_pg)
+  if [[ -n $1 ]]; then
+    on "$client" "sudo patronictl -c /etc/patroni/patroni.yml switchover $CLUSTER_NAME --leader $cur --candidate $1 --force"
+  else
+    on "$client" "sudo patronictl -c /etc/patroni/patroni.yml switchover $CLUSTER_NAME --leader $cur --force"
+  fi
+  sleep 5
+  on "$client" "sudo patronictl -c /etc/patroni/patroni.yml list"
+}
+
+cmd_psql() {
+  local port=$HAPROXY_RW_PORT client
+  [[ $1 == ro ]] && port=$HAPROXY_RO_PORT
+  if command -v psql >/dev/null; then
+    PGPASSWORD=$POSTGRES_PASSWORD exec psql -h "$VIP" -p "$port" -U postgres
+  fi
+  client=$(reachable_pg) || die "no PostgreSQL node reachable"
+  exec ssh -t -F "$SSH_CFG" -o LogLevel=ERROR "$client" "PGPASSWORD='$POSTGRES_PASSWORD' psql -h $VIP -p $port -U postgres"
+}
+
+cmd_logs() {
+  local node=${1:?usage: pglab logs <node> [service]} svc=$2
+  if [[ -z $svc ]]; then
+    case " $LB_NAMES " in *" $node "*) svc=haproxy ;; *) svc=patroni ;; esac
+  fi
+  [[ -s $SSH_CFG ]] || refresh_ssh
+  exec ssh -t -F "$SSH_CFG" -o LogLevel=ERROR "$node" "sudo journalctl -u $svc -n 100 -f"
+}
+
+usage() {
+  cat <<EOF
+Usage: ./pglab <command>
+
+Lifecycle
+  reset                  destroy everything, create VMs, deploy (clean rebuild)
+  up [node...]           create/start VMs
+  deploy                 (re)provision the cluster on running VMs — wipes data
+  down [node...]         halt VMs
+  teardown               destroy all VMs
+
+Operate
+  status                 Patroni members, etcd, VIP holder, HAProxy backends
+  test                   crash the leader VM, verify failover and rejoin
+  switchover [node]      planned leader change (optionally to <node>)
+  stop-node <node>       hard power-off one VM
+  start-node <node>      boot one VM (services start automatically)
+  psql [rw|ro]           connect through the VIP
+  ssh <node>             shell on a node
+  logs <node> [service]  follow journal (default: patroni / haproxy)
+
+Nodes: $ALL_NAMES
+EOF
+}
+
+case ${1:-} in
+  up)          shift; cmd_up "$@" ;;
+  deploy)      cmd_deploy ;;
+  reset)       vagrant destroy -f; cmd_up; cmd_deploy ;;
+  down)        shift; vagrant halt "$@" ;;
+  teardown)    vagrant destroy -f; rm -f "$SSH_CFG" ;;
+  status)      cmd_status ;;
+  test)        cmd_test ;;
+  switchover)  cmd_switchover "${2:-}" ;;
+  stop-node)   vagrant halt --force "${2:?node required}" ;;
+  start-node)  vagrant up "${2:?node required}"; refresh_ssh ;;
+  psql)        cmd_psql "${2:-rw}" ;;
+  ssh)         vagrant ssh "${2:?node required}" ;;
+  logs)        cmd_logs "${2:-}" "${3:-}" ;;
+  *)           usage ;;
+esac
