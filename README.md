@@ -1,7 +1,8 @@
-# pgvms — 6-node Patroni HA cluster for PostgreSQL 16
+# postgresql-patroni-cluster — 6-node Patroni HA cluster for PostgreSQL 16
 
 A clone-and-run lab on macOS (Apple Silicon) using Vagrant + VirtualBox and
-**Percona Distribution for PostgreSQL 16** on AlmaLinux 9.
+**Percona Distribution for PostgreSQL 16** on AlmaLinux 9. The cluster is
+named `pgvms` (`CLUSTER_NAME` in `cluster.conf`).
 
 ```
                      clients
