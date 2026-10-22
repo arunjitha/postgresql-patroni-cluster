@@ -27,28 +27,117 @@ named `pgvms` (`CLUSTER_NAME` in `cluster.conf`).
 | pghaproxy2 | 192.168.56.22 | HAProxy + Keepalived (BACKUP) |
 | VIP | 192.168.56.20 | Floating client endpoint |
 
-## Requirements
+## Setup
 
-- Vagrant ≥ 2.4, VirtualBox ≥ 7.1 (ARM host support)
-- ~14 GB free RAM with defaults (6 × 2 GB + 2 × 512 MB); adjust in `cluster.conf`
-- Internet access from the VMs (dnf + repo.percona.com)
+### 1. Check the host
 
-## Quick start
+Tested on macOS with Apple Silicon (arm64), 24 GB RAM, VirtualBox 7.2 and Vagrant 2.4.
+
+| Need | Default lab usage |
+|---|---|
+| Free RAM | ~13 GB (6 × 2 GB + 2 × 512 MB) |
+| CPU | 14 vCPUs allocated (overcommit is fine) |
+| Disk | ~15 GB (linked clones of one base box) |
+| Network | Internet access from the VMs (dnf + repo.percona.com) |
+
+Short on RAM? Lower `PG_MEMORY` in `cluster.conf` (1024 works for light testing).
+
+### 2. Install the tools
 
 ```bash
-./pglab reset     # destroy, create 8 VMs, deploy everything
-./pglab status    # Patroni members, etcd, VIP holder, HAProxy backends
-./pglab test      # power off the leader, verify failover via VIP, rejoin it
+brew install --cask virtualbox    # VirtualBox 7.1+ (needed for Apple Silicon hosts)
+brew install --cask vagrant       # Vagrant 2.4+
+brew install libpq                # psql client only, no server
+echo 'export PATH="/opt/homebrew/opt/libpq/bin:$PATH"' >> ~/.bash_profile   # ~/.zshrc for zsh
+source ~/.bash_profile
 ```
 
-Connect from the Mac (needs a local `psql`; otherwise `./pglab psql` runs it inside a node):
+After installing VirtualBox, allow its system extension in
+**System Settings → Privacy & Security** if macOS asks, then reboot.
+
+Check:
 
 ```bash
-psql -h 192.168.56.20 -p 5000 -U postgres   # read-write (leader)
-psql -h 192.168.56.20 -p 5001 -U postgres   # read-only (replicas, round robin)
+VBoxManage --version   # 7.1 or later
+vagrant --version      # 2.4 or later
+psql --version
 ```
+
+### 3. Clone the project
+
+```bash
+git clone https://github.com/arunjitha/postgresql-patroni-cluster.git
+cd postgresql-patroni-cluster
+```
+
+### 4. Review `cluster.conf` (optional)
+
+Everything — node names, IPs, VIP, ports, VM sizing and passwords — lives in
+`cluster.conf`. The defaults work as-is. If you change anything later, run
+`./pglab reset` to rebuild.
+
+Keep IPs inside `192.168.56.0/21`: VirtualBox on macOS refuses other host-only
+ranges unless you list them in `/etc/vbox/networks.conf`.
+
+### 5. Build the cluster
+
+```bash
+./pglab reset
+```
+
+This creates the 8 VMs (the first run also downloads the `bento/almalinux-9`
+box) and then deploys in dependency order:
+
+1. Base OS setup and packages on all nodes (in parallel)
+2. etcd quorum on pgnode1–3
+3. Patroni bootstrap of the leader on pgnode1
+4. Replicas pgnode2–6 clone from the leader (in parallel)
+5. `admin` superuser role
+6. HAProxy + Keepalived, then a write test through the VIP
+
+The deploy steps took about 6 minutes in testing, plus VM creation time.
+It ends by printing `./pglab status`.
+
+### 6. Verify
+
+```bash
+./pglab status
+```
+
+Expect one `Leader` in state `running`, five `Replica`s `streaming` with lag 0,
+three healthy etcd endpoints, and the VIP held by `pghaproxy1`. In the HAProxy
+list each node is `UP` in one pool and `DOWN` in the other — that is correct.
+
+### 7. Connect
+
+```bash
+export PGPASSWORD=postgres_pass
+psql -h 192.168.56.20 -p 5000 -U postgres   # read-write → leader
+psql -h 192.168.56.20 -p 5001 -U postgres   # read-only → replicas (round robin)
+```
+
+No local psql? `./pglab psql` (or `./pglab psql ro`) runs it inside a node.
 
 HAProxy stats: http://192.168.56.20:8080/ (admin/admin).
+
+### 8. Run the failover test
+
+```bash
+./pglab test
+```
+
+It writes a row through the VIP, hard powers off the leader VM, waits for a new
+leader, writes again through the VIP, reads both rows from the RO port, then
+boots the old leader and waits for it to rejoin as a replica. In testing,
+failover took about 30 seconds.
+
+### 9. Stop and start
+
+```bash
+./pglab down       # halt all VMs, frees the RAM
+./pglab up         # boot them again — services and the cluster recover on their own
+./pglab teardown   # destroy all VMs
+```
 
 ## Commands
 
@@ -63,7 +152,28 @@ HAProxy stats: http://192.168.56.20:8080/ (admin/admin).
 | `switchover [node]` | Planned leader change |
 | `stop-node` / `start-node <node>` | Hard power-off / boot one VM |
 | `psql [rw\|ro]` | Connect through the VIP |
-| `ssh <node>`, `logs <node> [svc]` | Shell / follow journal |
+| `ssh <node>`, `logs <node> [svc]` | Shell / follow journal (default svc: patroni or haproxy) |
+
+## Things to try
+
+```bash
+./pglab switchover pgnode3                 # planned leader change
+./pglab stop-node pghaproxy1               # VIP moves to pghaproxy2
+./pglab start-node pghaproxy1              # VIP moves back
+./pglab ssh pgnode1                        # then: sudo patronictl list
+./pglab logs pgnode2                       # follow Patroni's log
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `psql: command not found` | `brew install libpq` and add `/opt/homebrew/opt/libpq/bin` to `PATH` (step 2) |
+| `The IP address configured for the host-only network is not within the allowed ranges` | Use IPs in `192.168.56.0/21`, or add your range to `/etc/vbox/networks.conf` |
+| VM fails to boot / VirtualBox kernel error | Allow the VirtualBox extension in Privacy & Security and reboot |
+| `timed out waiting for …` during deploy | Re-run `./pglab deploy`; check `./pglab logs <node> etcd` or `patroni` |
+| `ssh` errors after VMs restart | Run any `./pglab up` / `start-node` — it refreshes `.vagrant/ssh-config` |
+| Out of memory, slow VMs | Lower `PG_MEMORY` / `LB_MEMORY` in `cluster.conf`, then `./pglab reset` |
 
 ## Layout
 
@@ -80,15 +190,6 @@ scripts/
   keepalived-setup.sh    VIP failover between HAProxy nodes
   cluster-state.sh       leader / health queries used by pglab
 ```
-
-Deploy order: base setup (parallel) → etcd quorum → leader bootstrap on `pgnode1`
-→ replicas clone in parallel → admin role → HAProxy + Keepalived → VIP check.
-
-## Customising
-
-Edit `cluster.conf` (IPs, node count, sizing, credentials) and run `./pglab reset`.
-On macOS, VirtualBox host-only networks must sit inside `192.168.56.0/21`
-unless you add ranges to `/etc/vbox/networks.conf`.
 
 ## Lab-only shortcuts
 
