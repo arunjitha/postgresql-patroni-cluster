@@ -18,6 +18,33 @@ By the end you will understand:
 > The cluster is named `pgvms` inside the configuration (`CLUSTER_NAME` in
 > `cluster.conf`). You will see that name in commands and output.
 
+### Background: where this lab comes from
+
+This lab follows on from my Percona blog post
+[**A Practical Guide to PostgreSQL Replication with Both Asynchronous and Synchronous Standbys**](https://www.percona.com/blog/a-practical-guide-to-postgresql-replication-with-both-asynchronous-and-synchronous-standbys/).
+That post builds replication **by hand**: one primary, one asynchronous and one
+synchronous standby, cloned with `pg_basebackup -R`, with
+`synchronous_standby_names` set manually and the setup checked through
+`pg_stat_replication`.
+
+It stops at the question every replication setup eventually faces: **what
+happens when the primary dies?** With manual replication, someone has to
+notice, promote a standby, repoint the applications and rebuild the old
+primary. This lab automates all of that:
+
+| In the blog (manual) | In this lab (automated) |
+|---|---|
+| You run `initdb`, `pg_basebackup -R` on each standby | Patroni bootstraps the primary and clones every replica |
+| You edit `postgresql.conf` / `pg_hba.conf` on each server | One config in Patroni/etcd, applied to every node |
+| You set `synchronous_standby_names` | Patroni sets it for you in synchronous mode ([Lab 11](#lab-11--async-and-sync-standbys-the-blog-setup-automated)) |
+| You promote a standby by hand after a failure | Patroni elects and promotes the best replica in ~30 s |
+| Applications need the new primary's address | HAProxy + a floating VIP: the address never changes |
+| You rebuild the old primary | Patroni rejoins it with `pg_rewind` |
+
+The core replication settings are the same as in the blog (`wal_level =
+replica`, `max_wal_senders = 10`, `wal_keep_size = 512MB`, `hot_standby = on`),
+so you can read the two side by side.
+
 ---
 
 ## Contents
@@ -77,6 +104,11 @@ network as they are produced. Replicas are usually milliseconds behind.
 **Asynchronous replication** (used here) — the primary does not wait for
 replicas to confirm before telling the client "committed". Fast, but a crash
 can lose the last few transactions that had not reached a replica yet.
+
+**Synchronous replication** — the primary waits until at least one chosen
+replica has the WAL before confirming a commit. No committed data is lost on
+failover, at the cost of slightly slower commits. Lab 11 shows both kinds
+side by side, like the blog post.
 
 **Failover** — unplanned: the primary dies, and a replica is promoted to
 replace it.
@@ -766,7 +798,66 @@ exit
 While paused, Patroni won't fail over or restart anything. You'd use this
 when you need to work on PostgreSQL by hand.
 
-### Lab 11 — Lose etcd quorum (what protects you)
+### Lab 11 — Async and sync standbys (the blog setup, automated)
+
+The [blog post](https://www.percona.com/blog/a-practical-guide-to-postgresql-replication-with-both-asynchronous-and-synchronous-standbys/)
+mixes one synchronous and one asynchronous standby by setting
+`synchronous_standby_names` by hand. Patroni can do the same, and keep it
+correct through failovers, with **synchronous mode**.
+
+Turn it on:
+
+```bash
+./pglab ssh pgnode1 -- sudo patronictl -c /etc/patroni/patroni.yml edit-config -s synchronous_mode=true --force
+sleep 15
+./pglab ssh pgnode1 -- sudo patronictl -c /etc/patroni/patroni.yml list
+```
+
+One replica's role changes to **Sync Standby**; the rest stay async:
+
+```
+| pgnode1 | 192.168.56.11 | Sync Standby | streaming |  3 | ...
+| pgnode2 | 192.168.56.12 | Replica      | streaming |  3 | ...
+| pgnode6 | 192.168.56.16 | Leader       | running   |  3 | ...
+```
+
+Look at what Patroni did on the primary — the same things the blog configures manually:
+
+```bash
+psql -h 192.168.56.20 -p 5000 -U postgres -XAt \
+  -c "SHOW synchronous_standby_names" \
+  -c "SELECT application_name, sync_state FROM pg_stat_replication ORDER BY 1"
+```
+
+```
+pgnode1
+pgnode1|sync
+pgnode2|async
+pgnode3|async
+...
+```
+
+Want two synchronous standbys?
+
+```bash
+./pglab ssh pgnode1 -- sudo patronictl -c /etc/patroni/patroni.yml edit-config -s synchronous_node_count=2 --force
+# synchronous_standby_names becomes: 2 (pgnode1,pgnode3)
+```
+
+**What changes:** a commit on the primary now waits until the sync standby has
+the WAL, so a failover never loses a committed transaction. Patroni also only
+promotes the sync standby on failover, and picks a new sync standby if the
+current one goes away. The cost is a little extra latency on every commit.
+
+Try Lab 7 again with synchronous mode on and watch which node becomes leader.
+
+Switch back to fully async:
+
+```bash
+./pglab ssh pgnode1 -- sudo patronictl -c /etc/patroni/patroni.yml edit-config -s synchronous_mode=false -s synchronous_node_count=1 --force
+```
+
+### Lab 12 — Lose etcd quorum (what protects you)
 
 > Run this last; it makes the cluster read-only until you restore etcd.
 
@@ -841,7 +932,7 @@ sudo journalctl -u patroni -f          # or -u etcd
 | `timed out waiting for …` during deploy | Re-run `./pglab deploy`; look at `./pglab logs <node> etcd` or `./pglab logs <node>` |
 | ssh errors after VMs restart | `./pglab up` or `start-node` refreshes `.vagrant/ssh-config` |
 | A replica stuck in `starting` or `stopped` | `sudo patronictl -c /etc/patroni/patroni.yml reinit pgvms <node>` re-copies it from the primary |
-| No leader, writes fail | Check etcd first (`etcdctl endpoint health --cluster`); Lab 11 explains why |
+| No leader, writes fail | Check etcd first (`etcdctl endpoint health --cluster`); Lab 12 explains why |
 | Mac slow or out of memory | Lower `PG_MEMORY` / `LB_MEMORY` in `cluster.conf`, then `./pglab reset` |
 
 ---
@@ -875,7 +966,7 @@ This lab takes shortcuts to stay simple. A production cluster should also have:
 | etcd on the database nodes | etcd on its own 3 or 5 small machines, in different zones |
 | Passwords in a text file | a secrets manager; strong, rotated passwords |
 | No watchdog | Linux `softdog`/hardware watchdog so a hung primary is reset |
-| Asynchronous replication | consider `synchronous_mode` if losing any committed transaction is unacceptable |
+| Asynchronous replication | `synchronous_mode` (Lab 11) if losing any committed transaction is unacceptable |
 | No backups | **pgBackRest** (also in the Percona distribution) with WAL archiving and restore tests |
 | No monitoring | Percona Monitoring and Management (PMM) or Prometheus + alerting |
 | All VMs on one laptop | separate hosts, racks or availability zones |
